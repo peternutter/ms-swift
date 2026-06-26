@@ -64,8 +64,12 @@ class GRPOVllmEngine(VllmEngine):
                           **kwargs) -> List[RolloutOutput]:
         if request_config is None:
             request_config = RequestConfig()
-        assert request_config.n == 1
+        if request_config.stream:
+            raise ValueError('Rollout async inference does not support streaming responses.')
 
+        # vLLM returns one RequestOutput per prompt with `n` completions in
+        # result.outputs. _create_chat_completion_response preserves those as
+        # response.choices, and the trainer flattens choices into samples.
         tasks = [self.infer_async(infer_request, request_config, **kwargs) for infer_request in infer_requests]
         if use_tqdm is None:
             use_tqdm = len(infer_requests) > 1
