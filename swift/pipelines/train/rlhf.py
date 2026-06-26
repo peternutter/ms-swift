@@ -91,7 +91,12 @@ class SwiftRLHF(SwiftSft):
                 task_type=task_type,
                 num_labels=num_labels)
 
-        adapters = args.adapters if key == 'ref' else args.reward_adapters
+        if key == 'ref':
+            adapters = args.adapters
+        elif key == 'teacher':
+            adapters = args.teacher_adapters
+        else:
+            adapters = args.reward_adapters
         model = prepare_adapter(args, model, adapters)
         if origin_key in {'ref', 'reward', 'teacher'}:
             if self.args.sequence_parallel_size > 1:
@@ -169,6 +174,22 @@ class SwiftRLHF(SwiftSft):
     @classmethod
     def prepare_model(cls, args, model, *, template=None, train_dataset=None, task_type=None):
         model = super().prepare_model(args, model, template=template, train_dataset=train_dataset, task_type=task_type)
+        gkd_teacher_adapter_name = getattr(args, '_teacher_adapter_name', None)
+        if args.rlhf_type == 'gkd' and gkd_teacher_adapter_name and args.teacher_adapters:
+            if args.tuner_type in tuners_map:
+                tuner: Tuner = tuners_map[args.tuner_type]
+            else:
+                tuner = Swift
+            assert len(args.teacher_adapters) == 1, f'args.teacher_adapters: {args.teacher_adapters}'
+            kwargs = {}
+            if version.parse(peft.__version__) >= version.parse('0.18'):
+                kwargs['is_trainable'] = False
+            model = tuner.from_pretrained(
+                model, args.teacher_adapters[0], adapter_name=gkd_teacher_adapter_name, **kwargs)
+            if hasattr(model, 'set_adapter'):
+                model.set_adapter(getattr(args, '_student_adapter_name', 'default'))
+            args.training_args.gkd_teacher_adapter_name = gkd_teacher_adapter_name
+            args.training_args.gkd_student_adapter_name = getattr(args, '_student_adapter_name', 'default')
         if args.ref_adapters:
             if args.tuner_type in tuners_map:
                 tuner: Tuner = tuners_map[args.tuner_type]
@@ -236,6 +257,8 @@ class SwiftRLHF(SwiftSft):
             if self.args.teacher_deepspeed:
                 trainer_kwargs['teacher_deepspeed_config'] = self.args.teacher_deepspeed
             trainer_kwargs['gkd_logits_topk'] = self.args.gkd_logits_topk
+            trainer_kwargs['gkd_teacher_adapter_name'] = getattr(self.args, '_teacher_adapter_name', None)
+            trainer_kwargs['gkd_student_adapter_name'] = getattr(self.args, '_student_adapter_name', 'default')
             if self.args.teacher_model_server:
                 trainer_kwargs['teacher_model_server'] = self.args.teacher_model_server
             trainer_kwargs['teacher_use_disable_adapter'] = getattr(self.args, '_teacher_use_disable_adapter', False)

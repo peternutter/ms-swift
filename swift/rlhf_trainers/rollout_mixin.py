@@ -54,6 +54,7 @@ logger = get_logger()
 class DataCache:
     """Cache container for rollout results"""
     results: DataType
+    submitted_step: Optional[int] = None
 
 
 class AsyncGenerateCallback(TrainerCallback):
@@ -178,8 +179,9 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         # Enable logprobs for vLLM importance sampling if requested
         structured_outputs_regex = getattr(args, 'structured_outputs_regex', None)
 
+        request_n = args.num_generations if getattr(args, 'rlhf_type', None) == 'gkd' else 1
         self.request_config = RequestConfig(
-            n=1,
+            n=request_n,
             max_tokens=args.max_completion_length,
             temperature=args.temperature,
             top_p=args.top_p,
@@ -967,6 +969,9 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 self.async_generate_rollout(all_inputs)
 
                 data_cache = self._queue.get()
+                self._last_async_rollout_submitted_step = data_cache.submitted_step
+                if data_cache.submitted_step is not None:
+                    self._last_async_rollout_lag_steps = self.state.global_step - data_cache.submitted_step
                 all_outputs = gather_object(data_cache.results)
 
                 per_device_datasize = len(all_outputs) // self.accelerator.num_processes
@@ -1184,9 +1189,19 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             if self.async_generate and not outputs:
                 return outputs
             assert len(inputs) == len(outputs)
-            return [
-                merge_output_input_data(deepcopy(input_data), output) for input_data, output in zip(inputs, outputs)
-            ]
+            results = []
+            for input_data, output in zip(inputs, outputs):
+                choices = output.response.choices
+                if len(choices) <= 1:
+                    results.append(merge_output_input_data(deepcopy(input_data), output))
+                    continue
+                for choice in choices:
+                    output_copy = deepcopy(output)
+                    response_copy = deepcopy(output.response)
+                    response_copy.choices = [choice]
+                    output_copy.response = response_copy
+                    results.append(merge_output_input_data(deepcopy(input_data), output_copy))
+            return results
 
         global_inputs = gather_object(inputs)
         results = []
@@ -1449,6 +1464,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
     def async_generate_rollout(self, all_inputs):
         """Async generation task for rollout"""
         current_queue = self._queue
+        submitted_step = self.state.global_step
 
         def infer_task():
             try:
@@ -1463,7 +1479,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         def done(future):
             try:
                 result = future.result()
-                current_queue.put(DataCache(result))
+                current_queue.put(DataCache(result, submitted_step=submitted_step))
             except Exception as e:
                 logger.error('Error in async_generate_rollout callback: %s', str(e))
 
@@ -1509,7 +1525,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             self._move_model_to_vllm(skip_async_check=True)
             self._last_loaded_step = self.state.global_step
         results = self._infer_single_or_multi_turn(all_inputs, self.request_config, is_global_inputs=True)
-        self._queue.put(DataCache(results))
+        self._queue.put(DataCache(results, submitted_step=self.state.global_step))
 
     @contextmanager
     def _disable_sp_context(self, template: Optional[Template] = None):

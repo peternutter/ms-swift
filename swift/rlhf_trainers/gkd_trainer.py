@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import math
 import os
 import random
 import torch
@@ -59,6 +60,9 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         self.vllm_client = kwargs.pop('vllm_client', None)
         self.gkd_logits_topk = kwargs.pop('gkd_logits_topk', None)
         teacher_model_server = kwargs.pop('teacher_model_server', None)
+        self.is_multimodal = model.model_meta.is_multimodal
+        self.gkd_teacher_adapter_name = kwargs.pop('gkd_teacher_adapter_name', None)
+        self.gkd_student_adapter_name = kwargs.pop('gkd_student_adapter_name', 'default')
 
         # Self-distillation: reuse base model as teacher via disable_adapter().
         teacher_use_disable_adapter = kwargs.pop('teacher_use_disable_adapter', False)
@@ -67,6 +71,7 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         self.lmbda = args.lmbda
         self.temperature = args.temperature
         self.seq_kd = args.seq_kd
+        self.gkd_loss_chunk_size = int(getattr(args, 'gkd_loss_chunk_size', 512) or 512)
         self.generation_config = model.generation_config
         self._metrics = {'train': defaultdict(list), 'eval': defaultdict(list)}
         self._total_train_tokens = 0
@@ -124,20 +129,39 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         return identity_data_collator
 
     def _get_train_sampler(self, train_dataset=None):
+        num_generations = int(getattr(self.args, 'num_generations', 1) or 1)
+        if str(getattr(self.args, 'rlhf_type', '')).lower() == 'gkd' and num_generations == 8:
+            # RLHFArguments defaults num_generations to GRPO's default. Preserve
+            # stock GKD behavior unless the run explicitly sets another value.
+            num_generations = 1
+        if self.args.generation_batch_size % num_generations != 0:
+            raise ValueError(
+                f'generation_batch_size ({self.args.generation_batch_size}) must be divisible by '
+                f'num_generations ({num_generations}).')
+        sampler_repeat_count = 1 if self.args.use_vllm and num_generations > 1 else num_generations
+        sampler_batch_size = self.args.generation_batch_size // num_generations
         return RepeatSampler(
             data_source=train_dataset or self.train_dataset,
-            mini_repeat_count=1,
-            batch_size=self.args.generation_batch_size,
+            mini_repeat_count=sampler_repeat_count,
+            batch_size=sampler_batch_size,
             repeat_count=self.args.steps_per_generation,
-            shuffle=getattr(self, 'shuffle_dataset', True),
+            shuffle=getattr(self.args, 'train_dataloader_shuffle', getattr(self, 'shuffle_dataset', True)),
             seed=self.args.seed,
         )
 
     def get_train_dataloader(self):
+        num_generations = int(getattr(self.args, 'num_generations', 1) or 1)
+        batch_size = self._train_batch_size * self.args.steps_per_generation
+        if self.args.use_vllm and num_generations > 1:
+            if batch_size % num_generations != 0:
+                raise ValueError(
+                    f'per-device batch window ({batch_size}) must be divisible by num_generations '
+                    f'({num_generations}).')
+            batch_size //= num_generations
         return self._get_dataloader(
             dataset=self.train_dataset,
             description='Training',
-            batch_size=self._train_batch_size * self.args.steps_per_generation,
+            batch_size=batch_size,
             sampler_fn=self._get_train_sampler,
             is_training=True,
         )
@@ -145,6 +169,21 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
     def _build_opsd_teacher_data(self, inputs):
         assert not self.use_liger_gkd_loss, 'OPSD is only supported when use_liger_gkd_loss is False.'
         return build_opsd_teacher_data(inputs, strip_assistant=True)
+
+    @contextmanager
+    def _adapter_context(self, model, adapter_name: Optional[str], restore_adapter_name: Optional[str] = None):
+        if adapter_name is None:
+            yield
+            return
+        unwrapped = self.accelerator.unwrap_model(model)
+        if not hasattr(unwrapped, 'set_adapter'):
+            raise ValueError('GKD teacher adapter swap requires a PEFT/Swift model with set_adapter().')
+        unwrapped.set_adapter(adapter_name)
+        try:
+            yield
+        finally:
+            if restore_adapter_name is not None:
+                unwrapped.set_adapter(restore_adapter_name)
 
     def _compute_jsd_loss(self, student_logits, teacher_output: TeacherOutput, labels):
         shifted_labels = torch.roll(labels, shifts=-1, dims=1)
@@ -157,7 +196,14 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             )
         if self.gkd_logits_topk is not None:
             teacher_output = teacher_output.to_topk(self.gkd_logits_topk)
-        total, num_valid = gkd_loss(student_logits, teacher_output, shifted_labels, self.beta, self.temperature)
+        total, num_valid = gkd_loss(
+            student_logits,
+            teacher_output,
+            shifted_labels,
+            self.beta,
+            self.temperature,
+            chunk_size=self.gkd_loss_chunk_size,
+        )
         if num_valid == 0:
             return total * 0
         return total / num_valid
@@ -229,17 +275,26 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             base_student = getattr(unwrapped_student, getattr(unwrapped_student, 'base_model_prefix', 'model'),
                                    unwrapped_student)
 
-            unwrapped_teacher = self.accelerator.unwrap_model(self.teacher_model)
-            base_teacher = getattr(unwrapped_teacher, getattr(unwrapped_teacher, 'base_model_prefix', 'model'),
-                                   unwrapped_teacher)
+            if self.gkd_teacher_adapter_name and self.teacher_model is None:
+                unwrapped_teacher = unwrapped_student
+                base_teacher = base_student
+            else:
+                unwrapped_teacher = self.accelerator.unwrap_model(self.teacher_model)
+                base_teacher = getattr(unwrapped_teacher, getattr(unwrapped_teacher, 'base_model_prefix', 'model'),
+                                       unwrapped_teacher)
 
             # Forward through base models
-            student_outputs = base_student(**model_inputs, use_cache=False)
+            student_adapter = self.gkd_student_adapter_name if self.gkd_teacher_adapter_name else None
+            with self._adapter_context(model, student_adapter, self.gkd_student_adapter_name):
+                student_outputs = base_student(**model_inputs, use_cache=False)
 
-            load_context = self.load_teacher_model_context() if self.args.offload_teacher_model else nullcontext()
+            load_context = (self.load_teacher_model_context()
+                            if self.args.offload_teacher_model and self.teacher_model is not None else nullcontext())
             with load_context:
-                with torch.no_grad(), disable_gradient_checkpointing(self.teacher_model,
-                                                                     self.args.gradient_checkpointing_kwargs):
+                teacher_model_for_context = self.teacher_model if self.teacher_model is not None else model
+                teacher_adapter = self.gkd_teacher_adapter_name if self.teacher_model is None else None
+                with torch.no_grad(), self._adapter_context(model, teacher_adapter, self.gkd_student_adapter_name), \
+                        disable_gradient_checkpointing(teacher_model_for_context, self.args.gradient_checkpointing_kwargs):
                     teacher_outputs = base_teacher(**model_inputs, use_cache=False)
 
                 # Get hidden states (shifted)
@@ -263,7 +318,9 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 teacher_head = unwrapped_teacher.get_output_embeddings()
 
                 # Prepare context managers for gathering parameters in zero3
-                teacher_context = get_gather_if_zero3_context(self, is_zero3=self.is_teacher_ds3)(teacher_head.weight)
+                teacher_context = get_gather_if_zero3_context(
+                    self, is_zero3=(self.is_teacher_ds3 if self.teacher_model is not None else False))(
+                        teacher_head.weight)
                 student_context = get_gather_if_zero3_context(self)(student_head.weight)
 
                 with teacher_context, student_context:
@@ -284,16 +341,21 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         elif self._is_self_distillation:
             if self.args.sft_alpha > 0:
                 model_inputs['labels'] = inputs['labels']
-            outputs_student = model(**model_inputs)
+            student_adapter = self.gkd_student_adapter_name if self.gkd_teacher_adapter_name else None
+            with self._adapter_context(model, student_adapter, self.gkd_student_adapter_name):
+                outputs_student = model(**model_inputs)
 
             t_fwd = teacher_fwd_inputs if teacher_fwd_inputs is not None else {
                 k: v
                 for k, v in model_inputs.items() if k != 'labels'
             }
 
-            adapter_ctx = (
-                self.accelerator.unwrap_model(model).disable_adapter()
-                if self._teacher_use_disable_adapter else nullcontext())
+            if self.gkd_teacher_adapter_name:
+                adapter_ctx = self._adapter_context(model, self.gkd_teacher_adapter_name, self.gkd_student_adapter_name)
+            elif self._teacher_use_disable_adapter:
+                adapter_ctx = self.accelerator.unwrap_model(model).disable_adapter()
+            else:
+                adapter_ctx = nullcontext()
             with torch.no_grad(), adapter_ctx, \
                     disable_gradient_checkpointing(model, self.args.gradient_checkpointing_kwargs):
                 outputs_teacher = model(**t_fwd)
@@ -398,10 +460,99 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             return
         messages = [inp['messages'][:-1] for inp in generated_inputs]
         completions = [deepcopy(inp['messages'][-1]['content']) for inp in generated_inputs]
+        filter_reasons = [inp.get('_gkd_filter_reason') for inp in generated_inputs]
+        is_truncated = [bool(inp.get('is_truncated', False)) for inp in generated_inputs]
         valid_messages = gather_object(messages)
         valid_completions = gather_object(completions)
+        valid_filter_reasons = gather_object(filter_reasons)
+        valid_is_truncated = gather_object(is_truncated)
+        sample_size = getattr(self.args, 'log_completions_sample_size', None)
+        if sample_size is not None and sample_size >= 0:
+            valid_messages = valid_messages[:sample_size]
+            valid_completions = valid_completions[:sample_size]
+            valid_filter_reasons = valid_filter_reasons[:sample_size]
+            valid_is_truncated = valid_is_truncated[:sample_size]
         self._logs['prompt'].extend(self._apply_chat_template_to_messages_list(valid_messages))
         self._logs['completion'].extend(valid_completions)
+        self._logs['filter_reason'].extend(valid_filter_reasons)
+        self._logs['is_truncated'].extend(valid_is_truncated)
+
+    @staticmethod
+    def _flatten_nested(values):
+        flat = []
+        if values is None:
+            return flat
+        if isinstance(values, torch.Tensor):
+            return values.detach().cpu().flatten().tolist()
+        if isinstance(values, (list, tuple)):
+            for value in values:
+                flat.extend(GKDTrainer._flatten_nested(value))
+            return flat
+        return [values]
+
+    def _should_filter_generated_input(self, data):
+        args = self.args
+        content = data.get('messages', [{}])[-1].get('content') or ''
+        if getattr(args, 'gkd_filter_truncated', False) and data.get('is_truncated', False):
+            return 'truncated'
+        if getattr(args, 'gkd_filter_unclosed_think', False) and '<think>' in content and '</think>' not in content:
+            return 'unclosed_think'
+
+        token_ids = self._flatten_nested(data.get('response_token_ids'))
+        logprobs = self._flatten_nested(data.get('rollout_logprobs'))
+        if token_ids and logprobs:
+            pairs = list(zip(token_ids, logprobs))
+            if getattr(args, 'gkd_filter_gibberish', False):
+                vocab_size = len(self.processing_class)
+                token_id_threshold = int(getattr(args, 'gkd_filter_gibberish_token_id_threshold', 100_000))
+                logprob_offset = float(getattr(args, 'gkd_filter_gibberish_logprob_offset', 2.0))
+                logprob_threshold = -math.log(vocab_size) - logprob_offset
+                for token_id, logprob in pairs:
+                    if int(token_id) > token_id_threshold and float(logprob) < logprob_threshold:
+                        return 'gibberish'
+            if getattr(args, 'gkd_filter_repetition', False):
+                window = int(getattr(args, 'gkd_filter_repetition_window', 3_000))
+                prob_threshold = float(getattr(args, 'gkd_filter_repetition_prob_threshold', 0.99))
+                logprob_threshold = math.log(prob_threshold)
+                consecutive = 0
+                for _, logprob in pairs:
+                    if float(logprob) > logprob_threshold:
+                        consecutive += 1
+                    else:
+                        consecutive = 0
+                    if consecutive >= window:
+                        return 'repetition'
+        return None
+
+    def _filter_generated_pairs(self, rollout_inputs: DataType, generated_inputs: DataType):
+        pairs = list(zip(rollout_inputs, generated_inputs))
+        if not pairs:
+            return rollout_inputs, generated_inputs
+        filtered_pairs = []
+        counts = defaultdict(int)
+        for rollout_input, generated_input in pairs:
+            reason = self._should_filter_generated_input(generated_input)
+            generated_input['_gkd_filter_reason'] = reason
+            counts['seen'] += 1
+            if reason is not None:
+                counts[f'dropped_{reason}'] += 1
+                counts['dropped'] += 1
+                continue
+            filtered_pairs.append((rollout_input, generated_input))
+
+        if counts['dropped']:
+            counts['kept'] = len(filtered_pairs)
+            for name, value in counts.items():
+                self._rollout_filter_stats[name] += value
+        if not filtered_pairs:
+            raise ValueError('All generated GKD rollouts were filtered; refusing to train on an empty rollout batch.')
+        if len(filtered_pairs) < self.args.steps_per_generation:
+            raise ValueError(
+                f'Only {len(filtered_pairs)} generated GKD rollouts survived filtering, fewer than '
+                f'steps_per_generation={self.args.steps_per_generation}. Increase generation_batch_size or relax '
+                'filters.')
+        new_rollout_inputs, new_generated_inputs = zip(*filtered_pairs)
+        return list(new_rollout_inputs), list(new_generated_inputs)
 
     def _build_encoded_inputs(self,
                               model: nn.Module,
@@ -537,7 +688,21 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
                 processed_inputs = self._preprocess_inputs(rollout_inputs)
                 generated_inputs = self._fast_infer(processed_inputs)
-                self._log_student_completions(generated_inputs)
+                if getattr(self, 'async_generate', False):
+                    # Async rollout is one generation batch behind. Train on the generated
+                    # batch itself so prompts and completions remain aligned.
+                    rollout_inputs = generated_inputs
+                if len(generated_inputs) != len(rollout_inputs):
+                    if len(generated_inputs) % len(rollout_inputs) != 0:
+                        raise ValueError(
+                            f'Generated sample count ({len(generated_inputs)}) must be a multiple of prompt count '
+                            f'({len(rollout_inputs)}).')
+                    repeats = len(generated_inputs) // len(rollout_inputs)
+                    rollout_inputs = [deepcopy(item) for item in rollout_inputs for _ in range(repeats)]
+
+                all_generated_inputs = generated_inputs
+                rollout_inputs, generated_inputs = self._filter_generated_pairs(rollout_inputs, generated_inputs)
+                self._log_student_completions(all_generated_inputs)
 
                 input_chunks = self.split_by_mini_batches(rollout_inputs)
                 generated_chunks = self.split_by_mini_batches(generated_inputs)
@@ -714,10 +879,13 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             assert self.args.sft_alpha == 0, 'SFT loss is not supported with liger loss'
             assert self.gkd_logits_topk is None, 'Top-k mode is not supported with liger loss'
             self.liger_jsd_loss = LigerFusedLinearJSDLoss(
+                weight_hard_loss=0.0,
+                weight_soft_loss=1.0,
                 beta=self.beta,
                 ignore_index=-100,
                 temperature=self.temperature,
                 compiled=False,
+                chunk_size=self.gkd_loss_chunk_size,
             )
             self.use_liger_gkd_loss = True
 
@@ -726,12 +894,20 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         args = self.args
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = getattr(args, 'wandb_log_unique_prompts', False)
-        self.jsonl_writer = JsonlWriter(os.path.join(self.args.output_dir, 'completions.jsonl'))
+        self.log_completions_to_wandb = getattr(args, 'log_completions_to_wandb', False)
+        self.log_completions_to_swanlab = getattr(args, 'log_completions_to_swanlab', False)
+        self.jsonl_writer = JsonlWriter(
+            os.path.join(self.args.output_dir, 'completions.jsonl'),
+            enable_async=getattr(args, 'log_completions_async', True),
+        )
+        self._rollout_filter_stats = defaultdict(int)
 
         # Initialize logs deque for storing rollout data (aligned with GRPO)
         self._logs = {
             'prompt': deque(),
             'completion': deque(),
+            'filter_reason': deque(),
+            'is_truncated': deque(),
         }
 
     def _apply_chat_template_to_messages_list(self, messages_list: DataType):
@@ -749,6 +925,22 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         # Call parent log method
         import transformers
         from packaging import version
+        if self._rollout_filter_stats:
+            seen = self._rollout_filter_stats.get('seen', 0)
+            for name, value in list(self._rollout_filter_stats.items()):
+                logs[f'rollout_filter/{name}'] = value
+            if seen:
+                logs['rollout_filter/drop_rate'] = self._rollout_filter_stats.get('dropped', 0) / seen
+            self._rollout_filter_stats.clear()
+        if getattr(self, 'async_generate', False):
+            logs['rollout_async/enabled'] = 1.0
+            logs['rollout_async/max_off_policy_batches'] = 1.0
+            lag_steps = getattr(self, '_last_async_rollout_lag_steps', None)
+            if lag_steps is not None:
+                logs['rollout_async/lag_steps'] = float(lag_steps)
+            submitted_step = getattr(self, '_last_async_rollout_submitted_step', None)
+            if submitted_step is not None:
+                logs['rollout_async/submitted_step'] = float(submitted_step)
         if version.parse(transformers.__version__) >= version.parse('4.47.0.dev0'):
             super().log(logs, start_time)
         else:
@@ -761,6 +953,8 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 'step': [str(self.state.global_step)] * seen_nums,
                 'prompt': list(self._logs['prompt'])[:seen_nums],
                 'completion': list(self._logs['completion'])[:seen_nums],
+                'filter_reason': list(self._logs['filter_reason'])[:seen_nums],
+                'is_truncated': list(self._logs['is_truncated'])[:seen_nums],
             }
 
             # Write to jsonl
@@ -768,10 +962,16 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
             self._logs['prompt'].clear()
             self._logs['completion'].clear()
+            self._logs['filter_reason'].clear()
+            self._logs['is_truncated'].clear()
             # Log to wandb if enabled
-            report_to_wandb = self.args.report_to and 'wandb' in self.args.report_to and wandb.run is not None
+            report_to_wandb = (self.log_completions_to_wandb and self.args.report_to
+                               and 'wandb' in self.args.report_to and wandb.run is not None)
             if report_to_wandb:
                 wandb_table = table.copy()
+                sample_size = getattr(self.args, 'log_completions_sample_size', None)
+                if sample_size is not None and sample_size >= 0:
+                    wandb_table = {k: v[:sample_size] for k, v in wandb_table.items()}
                 import pandas as pd
                 df = pd.DataFrame(wandb_table)
                 if self.wandb_log_unique_prompts:
@@ -779,9 +979,12 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 wandb.log({'completions': wandb.Table(dataframe=df)})
 
             # Log to swanlab if enabled
-            report_to_swanlab = self.args.report_to and 'swanlab' in self.args.report_to and swanlab_get_run(
-            ) is not None
+            report_to_swanlab = (self.log_completions_to_swanlab and self.args.report_to
+                                 and 'swanlab' in self.args.report_to and swanlab_get_run() is not None)
             if report_to_swanlab:
+                sample_size = getattr(self.args, 'log_completions_sample_size', None)
+                if sample_size is not None and sample_size >= 0:
+                    table = {k: v[:sample_size] for k, v in table.items()}
                 headers = list(table.keys())
                 rows = []
                 for i in range(len(table['step'])):

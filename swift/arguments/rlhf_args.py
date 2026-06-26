@@ -221,6 +221,21 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             If set to a positive integer, only top-k teacher logits are used (more efficient).
             When using `teacher_model_server`, this is limited by the server's `max_logprobs` setting
             (vLLM default is 20, can be increased with `--max-logprobs`). Defaults to None.
+        gkd_loss_chunk_size (int): Number of active response-token positions per dense full-vocab KL chunk.
+            Smaller values reduce log-softmax/KL scratch memory and long update spikes, but do not avoid
+            materializing full logits. Defaults to 512.
+        log_completions_sample_size (Optional[int]): If completion W&B/SwanLab table logging is enabled, cap the
+            number of completions sent to those services. Local JSONL logging still writes all completions.
+            Defaults to None.
+        log_completions_async (bool): Write local completion JSONL through SWIFT's async writer. Defaults to True.
+        log_completions_to_wandb (bool): Send completion tables to W&B. Defaults to False.
+        log_completions_to_swanlab (bool): Send completion tables to SwanLab. Defaults to False.
+        gkd_filter_truncated (bool): Drop student rollouts that hit the generation length limit. Defaults to False.
+        gkd_filter_unclosed_think (bool): Drop student rollouts that contain <think> without </think>. Defaults to False.
+        gkd_filter_gibberish (bool): Drop rare-token/high-entropy gibberish rollouts when rollout logprobs are
+            available. Defaults to False.
+        gkd_filter_repetition (bool): Drop high-confidence repetition loops when rollout logprobs are available.
+            Defaults to False.
         offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD
             training. Defaults to False.
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
@@ -259,6 +274,19 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     lmbda: float = 0.5
     seq_kd: bool = False
     gkd_logits_topk: Optional[int] = None
+    gkd_loss_chunk_size: int = 512
+    log_completions_sample_size: Optional[int] = None
+    log_completions_async: bool = True
+    log_completions_to_wandb: bool = False
+    log_completions_to_swanlab: bool = False
+    gkd_filter_truncated: bool = False
+    gkd_filter_unclosed_think: bool = False
+    gkd_filter_gibberish: bool = False
+    gkd_filter_gibberish_token_id_threshold: int = 100_000
+    gkd_filter_gibberish_logprob_offset: float = 2.0
+    gkd_filter_repetition: bool = False
+    gkd_filter_repetition_window: int = 3_000
+    gkd_filter_repetition_prob_threshold: float = 0.99
     offload_teacher_model: bool = False
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
@@ -579,15 +607,26 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             raise NotImplementedError('Currently, multi_turn_scheduler is not supported for GKD.')
 
         if self.async_generate:
-            raise NotImplementedError('Currently, async_generate is not supported for GKD.')
+            logger.warning('GKD async_generate is enabled. This uses one-rollout-lag generated data, so updates are '
+                           'slightly off-policy instead of strictly synchronous on-policy.')
 
         if self.teacher_model is not None and self.teacher_model_server is not None:
             raise ValueError('GKD requires either `teacher_model` or `teacher_model_server` to be set, not both.')
 
         # Self-distillation: teacher_model == student model
         self._teacher_use_disable_adapter = False
+        self._teacher_adapter_name = None
+        self._student_adapter_name = 'default'
         if self.teacher_model is not None and self.teacher_model == self.model:
-            if self.tuner_type == 'lora':
+            if self.tuner_type == 'lora' and self.teacher_adapters:
+                if len(self.teacher_adapters) != 1:
+                    raise ValueError(f'GKD adapter-swap teacher currently supports one teacher adapter, got: '
+                                     f'{self.teacher_adapters}')
+                logger.info('LoRA + same teacher_model + teacher_adapters: loading the teacher LoRA as a frozen '
+                            'named adapter on the student model (no extra base model).')
+                self._teacher_adapter_name = 'gkd_teacher'
+                self.teacher_model = None
+            elif self.tuner_type == 'lora':
                 logger.info('LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')
                 self._teacher_use_disable_adapter = True
                 self.teacher_model = None
@@ -597,12 +636,15 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         # Self-distillation: no teacher_model → dynamic teacher (current student weights)
         if self.teacher_model is None and self.teacher_model_server is None:
-            logger.info('No teacher_model specified. Using self-distillation mode (teacher = student).')
+            if self._teacher_adapter_name:
+                logger.info(f'Using GKD teacher adapter `{self._teacher_adapter_name}` on the student model.')
+            else:
+                logger.info('No teacher_model specified. Using self-distillation mode (teacher = student).')
 
             if self.seq_kd:
                 raise ValueError(
                     'Self-distillation mode with seq_kd is not supported yet, please specify a teacher_model.')
-            if self.use_liger_kernel:
+            if self.use_liger_kernel and not self._teacher_adapter_name:
                 raise ValueError('Self-distillation mode with liger kernel GKD loss is not supported yet')
 
         # When using teacher_model_server, gkd_logits_topk is required (API only returns top-k logprobs)

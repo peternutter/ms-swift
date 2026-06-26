@@ -1,5 +1,7 @@
 # SWIFT (Scalable lightWeight Infrastructure for Fine-Tuning)
 
+> This is the `peternutter/ms-swift` fork used by the MATS why-gen project. It tracks ModelScope SWIFT and carries local GKD changes for async on-policy distillation, rollout filtering/logging, same-base teacher-adapter training, and fused-linear GKD loss checks.
+
 <p align="center">
     <br>
     <img src="asset/banner.png"/>
